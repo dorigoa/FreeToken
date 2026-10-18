@@ -42,21 +42,21 @@ These families accept image input by default; pass `--text-model-only` to skip t
 `ft serve --moe-strategy {auto,fused,offload,cpu,hybrid}` (`--moe-backend` is the deprecated old spelling):
 
 - **fused** — experts resident on GPU (needs the VRAM). Serves every expert
-  format except GGUF and DeepSeek-V4's.
+  format except DeepSeek-V4's.
 - **offload** — experts live in host RAM, an LRU cache of expert slots on GPU;
   misses stream over PCIe.
 - **cpu** — misses are computed on the CPU instead of fetched.
 - **hybrid** — per step, fetches some misses over PCIe and computes the rest on
-  CPU, overlapped. Run `ft bench bw` once per machine to calibrate the split.
+  CPU, overlapped. Run `ft bench bw --model <checkpoint>` once per machine and
+  model to calibrate the split.
 - **auto** — dense models always resolve to `fused`; MoE models resolve to
-  `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
-  recommends it. Unified-memory GPUs differ, see below.
+  `offload`. Unified-memory GPUs differ, see below.
 
 ### Unified-memory GPUs (GB10 / DGX Spark)
 
 The GPU and the CPU share one DRAM, so offload only copies experts between two
 names for the same memory. On these GPUs `auto` resolves every MoE model to
-`fused`: the default is the resident path only. GGUF and DeepSeek-V4 experts
+`fused`: the default is the resident path only. DeepSeek-V4 experts
 have no resident path and stay on `offload`. Offload-only flags
 (`--moe-cpu-layers`, `--moe-cache-size` / `-rate` / `-auto`,
 `--moe-prefill-hit-d2d`, `--disable-moe-prefill-overlap`) are ignored with a
@@ -107,7 +107,7 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   Bounded output differs from exact by construction and does not depend on the prefill chunk size.
   Under expert offload the prefill time is bounded by streaming each layer's experts, so decoder
   replay saves decoder-layer compute, not prefill time.
-  Run `ft bench bw --model dsv4.1-flash` to measure local PCIe and CPU bandwidth before
+  Run `ft bench bw --model <checkpoint>` to measure local PCIe and CPU bandwidth before
   choosing a MoE strategy; `--moe-strategy hybrid` splits expert misses using those
   measurements. With `--moe-cache-auto`, `--kv-reserve-tokens` sets the token capacity reserved
   before the expert cache is allocated, subject to the attention pool's structural minimum; size it

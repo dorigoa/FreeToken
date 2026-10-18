@@ -10,6 +10,7 @@ Coverage by hardware:
     baseline-kernel equality guard. This is the path used on sm_120 + CUDA 12.x.
   - Marlin (sm_80..sm_99, e.g. H100): prefill + decode + overlap.
   - b12x (sm_120 + CUDA>=13): pack + fused decode, skipped where the kernel cannot run.
+  - Gluon (sm_120): the prefill GEMMs it takes over from the Triton kernel, against that kernel.
 Banks are built the way the loader builds them: the bound kernel object packs native pieces.
 """
 
@@ -187,7 +188,7 @@ def test_marlin_prefill_matches_dequant_reference():
     cache.materialize_layer(0)
     cache.copy_missing()
     g1, g2 = cache.alphas_for_layer(0)
-    gu_p, gu_s, dn_p, dn_s = cache.bank_views(E)
+    gu_p, gu_s, dn_p, dn_s = cache.stage_views(0, 0)
     out = marlin_fused_experts(
         hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
         topk_weights, topk_ids, "silu", False,
@@ -214,7 +215,7 @@ def test_marlin_decode_matches_dequant_reference_after_prefill_stomp():
         cache.ensure_experts(layer_id, ids)  # rewrites ids -> slots in place
         cache.copy_missing()
         g1, g2 = cache.alphas_for_slots(layer_id)
-        gu_p, gu_s, dn_p, dn_s = cache.bank_views()
+        gu_p, gu_s, dn_p, dn_s = cache.pool_bank_views(layer_id)
         out = marlin_fused_experts(
             hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
             topk_weights, ids, "silu", False,
@@ -278,7 +279,7 @@ def test_marlin_overlap_prefill_matches_dequant_reference():
     assert int(cache.num_indices.item()) == 2, "stale slot mappings survived the prefetch"
     cache.copy_missing()
     g1, g2 = cache.alphas_for_slots(0)
-    gu_p, gu_s, dn_p, dn_s = cache.bank_views()
+    gu_p, gu_s, dn_p, dn_s = cache.pool_bank_views(0)
     out = marlin_fused_experts(
         dec_hidden, gu_p, gu_s, g1, dn_p, dn_s, g2,
         dec_weights, ids, "silu", False,
@@ -366,6 +367,52 @@ def test_triton_swigluoai_matches_dequant_reference():
     _assert_close(out, ref)
 
 
+@cuda
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0), reason="needs sm_120")
+@pytest.mark.parametrize("hidden_size,inter", [(256, 128), (384, 192)])
+@pytest.mark.parametrize("block_m", [64, 128])
+def test_triton_prefill_routes_to_gluon_on_sm120(monkeypatch, hidden_size, inter, block_m):
+    """Both prefill GEMMs go to the Gluon kernel and match the Triton kernel: persistent (BLOCK_SIZE_M 64) and not (128), 256- and 128-row tiles, K % 256 == 0 and not."""
+    import freetoken.moe.fused_nvfp4 as fused_nvfp4
+    from freetoken.kernel import gluon, nvfp4_moe
+
+    if not gluon.available():
+        pytest.skip(f"Gluon is off or needs Triton {'.'.join(map(str, gluon.TRITON_VERSION))}")
+    from freetoken.kernel.gluon.nvfp4.moe import sm120
+
+    # the GPU class picks BLOCK_SIZE_M from tokens per expert; pin it so every sm_120 class runs both kernel modes
+    config = nvfp4_moe.prefill_config
+    monkeypatch.setattr(nvfp4_moe, "prefill_config", lambda *args: {**config(*args), "BLOCK_SIZE_M": block_m})
+
+    device = torch.device("cuda")
+    g = torch.Generator(device=device).manual_seed(0)
+
+    def bank(n, k):
+        packed = torch.randint(0, 256, (E, n, k // 2), dtype=torch.uint8, device=device, generator=g)
+        scale = (torch.rand(E, n, k // 16, device=device, generator=g) + 0.25).to(torch.float8_e4m3fn)
+        return packed, scale, (torch.rand(E, n, device=device, generator=g) + 0.5).to(torch.float16)
+
+    banks = (*bank(2 * inter, hidden_size), *bank(hidden_size, inter))
+    M = 1024
+    hidden = torch.randn(M, hidden_size, dtype=torch.bfloat16, device=device, generator=g) / 4
+    topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=device, generator=g)
+    topk_weights = torch.rand(M, TOPK, device=device, generator=g)
+
+    calls = []
+    gluon_gemm = sm120.prefill_gemm
+
+    def counted(*args):
+        calls.append(args)
+        return gluon_gemm(*args)
+
+    monkeypatch.setattr(sm120, "prefill_gemm", counted)
+    out = fused_nvfp4.fused_experts_nvfp4(hidden, *banks, topk_weights, topk_ids, E)
+    assert len(calls) == 2
+    monkeypatch.setattr(nvfp4_moe, "_gluon_prefill", lambda device_index: None)
+    ref = fused_nvfp4.fused_experts_nvfp4(hidden, *banks, topk_weights, topk_ids, E)
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2 * float(ref.abs().max()))
+
+
 def _triton_cache(device, *, cache_size=S, prefill_overlap=False):
     """Native 6-bank NVFP4 cache (no repack), consumed directly by the Triton kernels.
     The banks are not transformed, so ``sources`` doubles as the dequant reference."""
@@ -403,7 +450,7 @@ def test_triton_decode_marlin_matches_dequant_reference_after_prefill_stomp():
         ref = _ref_moe(ref_sources, layer_id, hidden, topk_weights, ids)
         cache.ensure_experts(layer_id, ids)  # rewrites ids -> slots in place
         cache.copy_missing()
-        gu_p, gu_s, gu_g, dn_p, dn_s, dn_g = cache.bank_views()
+        gu_p, gu_s, gu_g, dn_p, dn_s, dn_g = cache.pool_bank_views(layer_id)
         out = fused_experts_decode_nvfp4_marlin(
             hidden, gu_p, gu_s, gu_g, dn_p, dn_s, dn_g, topk_weights, ids, "silu", False
         )
@@ -433,7 +480,7 @@ def test_triton_decode_marlin_matches_baseline_kernel():
     ids = torch.tensor([[1, 6]], dtype=torch.int32, device=device)
     cache.ensure_experts(0, ids)
     cache.copy_missing()
-    banks = cache.bank_views()
+    banks = cache.pool_bank_views(0)
     marlin = fused_experts_decode_nvfp4_marlin(hidden, *banks, topk_weights, ids, "silu", False)
     base = fused_experts_decode_nvfp4_serial(hidden, *banks, topk_weights, ids, "silu", False)
     torch.testing.assert_close(marlin.float(), base.float(), rtol=2e-3, atol=2e-3)
@@ -461,7 +508,7 @@ def test_b12x_decode_matches_dequant_reference():
     cache.ensure_experts(0, ids)
     cache.copy_missing()
     g1, g2 = cache.alphas_for_slots(0)
-    gu_p, gu_s, dn_p, dn_s = cache.bank_views()
+    gu_p, gu_s, dn_p, dn_s = cache.pool_bank_views(0)
     out = b12x_fused_experts(
         hidden, gu_p, gu_s, g1, dn_p, dn_s, g2, topk_weights, ids, "silu", False
     )

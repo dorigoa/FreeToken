@@ -134,6 +134,7 @@ def parse_args(
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
     from freetoken.moe import MOE_STRATEGIES
+    from freetoken.moe.pool_policy import SCOPES
 
     def _parse_quant_backend(value: str) -> str:
         from freetoken.layers.quantization import QuantBackend
@@ -152,6 +153,27 @@ def parse_args(
         if not 0 <= rate <= 1:
             raise argparse.ArgumentTypeError("must be in [0, 1]")
         return rate
+
+    def _parse_mem_size(value: str) -> int:
+        units = {
+            "b": 1, "k": 1 << 10, "kb": 1 << 10, "kib": 1 << 10, "m": 1 << 20, "mb": 1 << 20, "mib": 1 << 20,
+            "g": 1 << 30, "gb": 1 << 30, "gib": 1 << 30,
+        }
+        text = value.strip().lower()
+        number = text.rstrip("abgikm")
+        unit = text[len(number):]
+        try:
+            size = int(float(number) * units[unit])
+        except (KeyError, ValueError, OverflowError) as exc:
+            raise argparse.ArgumentTypeError("must be a size with a unit, e.g. 12GiB or 800MiB") from exc
+        if size <= 0:
+            raise argparse.ArgumentTypeError("must be positive")
+        return size
+
+    def _parse_cache_split(value: str) -> str:
+        if value == "equal" or (value.startswith("profile:") and len(value) > len("profile:")):
+            return value
+        raise argparse.ArgumentTypeError("must be equal or profile:<path>")
 
     def _positive_int(value: str) -> int:
         try:
@@ -622,9 +644,8 @@ def parse_args(
         default=ServerArgs.moe_strategy,
         choices=["auto", *MOE_STRATEGIES],
         help=(
-            "How the routed experts are served. 'auto' resolves a MoE model to the offload family "
-            "(offload, or hybrid when a `ft bench bw` profile recommends it), and to resident "
-            "'fused' experts on unified-memory GPUs (GB10 / DGX Spark)."
+            "How the routed experts are served. 'auto' resolves a MoE model to 'offload', and to "
+            "resident 'fused' experts on unified-memory GPUs (GB10 / DGX Spark)."
         ),
     )
 
@@ -706,6 +727,12 @@ def parse_args(
         help="The fraction of all MoE experts to keep in GPU cache.",
     )
     moe_cache_group.add_argument(
+        "--moe-cache-mem",
+        type=_parse_mem_size,
+        default=ServerArgs.moe_cache_mem,
+        help="GPU memory for the MoE expert slot cache, e.g. 12GiB or 800MiB (G, GB and GiB all mean GiB); the slot count is this over the bytes per slot.",
+    )
+    moe_cache_group.add_argument(
         "--moe-cache-auto",
         action="store_true",
         default=ServerArgs.moe_cache_auto,
@@ -720,6 +747,27 @@ def parse_args(
         type=int,
         default=ServerArgs.kv_reserve_tokens,
         help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
+    )
+
+    parser.add_argument(
+        "--moe-cache-scope",
+        choices=SCOPES,
+        default=ServerArgs.moe_cache_scope,
+        help=(
+            "How MoE layers share the GPU expert slot cache: unified = one LRU pool per expert quant "
+            "(all layers when they share one quant format); per-layer = each layer has its own pool. "
+            "Pools are sized by --moe-cache-split."
+        ),
+    )
+    parser.add_argument(
+        "--moe-cache-split",
+        type=_parse_cache_split,
+        default=ServerArgs.moe_cache_split,
+        help=(
+            "How pools share the slots: equal (by layer count), or profile:<path> = by expert use from a "
+            "profile file. With --moe-strategy offload, a pool smaller than the expert count limits the "
+            "decode batch to its slots / top_k."
+        ),
     )
 
     parser.add_argument(
@@ -764,7 +812,8 @@ def parse_args(
             "For --moe-strategy hybrid: max experts fetched over PCIe per (layer, decode "
             "step); the rest of that step's misses are computed on the CPU, overlapped. "
             "-1 (default) = auto: fetch the benched pcie/cpu bandwidth fraction of each "
-            "step's misses (perfect overlap; needs an `ft bench bw` profile, else 1). "
+            "step's misses (perfect overlap; needs the `ft bench bw` row of the layer's kind, "
+            "from `ft bench bw --model <checkpoint>`, else 1). "
             "0 = never fetch (all misses on CPU); large = behaves like plain offload."
         ),
     )
@@ -892,6 +941,7 @@ def parse_args(
     _no_cache_flag = (
         kwargs["moe_cache_size"] == 0
         and not kwargs["moe_cache_auto"]
+        and kwargs["moe_cache_mem"] is None
         and (kwargs["moe_cache_rate"] is None or kwargs["moe_cache_rate"] == 0)
     )
     if is_offload_moe_strategy(kwargs["moe_strategy"]) and _no_cache_flag:
