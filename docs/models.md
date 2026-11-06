@@ -1,6 +1,6 @@
 # Supported models
 
-FreeToken loads HF safetensors checkpoints directly. The checkpoints below are known-good — the prebuilt kernels are tuned
+FreeToken loads HF safetensors checkpoints and llama.cpp [GGUF](#gguf) files directly. The checkpoints below are known-good — the prebuilt kernels are tuned
 for them; other checkpoints of the same architectures work too.
 
 | Model | HF checkpoints |
@@ -20,6 +20,29 @@ for them; other checkpoints of the same architectures work too.
 | MiniMax-M2.5 | [nvidia/MiniMax-M2.5-NVFP4](https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4) |
 | MiniMax-M3 | [nvidia/MiniMax-M3-NVFP4](https://huggingface.co/nvidia/MiniMax-M3-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
+| Flint | [FutureMLS-Lab/flint-nvfp4-coldgptq](https://huggingface.co/FutureMLS-Lab/flint-nvfp4-coldgptq), [RecursiveSI/flint-nvfp4-gguf](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf) |
+
+### GGUF
+
+`--model` takes a local `.gguf` file; for a split GGUF, pass its first file (`*-00001-of-0000N.gguf`) with the others beside it.
+These llama.cpp architectures (`general.architecture`) are served:
+
+| GGUF architecture | Models |
+|---|---|
+| `qwen35moe`, `qwen35` | Qwen3.5 / Qwen3.6 MoE and dense, Qwen3.8 dense |
+| `qwen4exp` | Qwen3.8-Flash-Next |
+| `qwen3moe`, `qwen3` | Qwen3 MoE and dense |
+| `qwen3vlmoe`, `qwen3vl` | Qwen3-VL |
+| `qwen2` | Qwen2, Qwen2.5 |
+| `llama` | Llama, Mistral |
+| `gemma4` | Gemma-4, except E2B / E4B |
+| `glm4moe` | GLM-4.5, GLM-4.6, GLM-4.7 |
+| `glm5-next` | GLM-5.3-Flash |
+| `deepseek4` | DeepSeek-V4 Flash and Pro |
+| `minimax-m2`, `minimax-m3` | MiniMax-M2, MiniMax-M3 |
+| `muse-glimmer` | Muse-Glimmer |
+| `gpt-oss` | gpt-oss |
+| `flint` | Flint |
 
 ### Image input
 
@@ -36,6 +59,11 @@ These families accept image input by default; pass `--text-model-only` to skip t
 | Muse-Glimmer-30B (windowed ViT tower, streamed under `--mm-encoder-weights host`) | one token per 28x28 pixels of the resized image, aspect ratio kept under a token cap; checkpoint default 4096 tokens | the maximum is the cap (`max_image_tokens`); the minimum has no effect | `{"max_image_tokens": 1024}` |
 | MiniMax-M3 (`minimax_m3`: CLIP-style ViT tower, streamed under `--mm-encoder-weights host`) | one token per 28x28 pixels of the resized image, dynamic resolution | pixel areas in `size.shortest_edge` / `longest_edge`; checkpoint defaults 4 to 576 tokens | `{"size": {"longest_edge": 1048576}}` |
 | DeepSeek-V4-Flash-Vision (`deepseek_v4`: native-resolution ViT tower, streamed under `--mm-encoder-weights host`) | one token per 3x3 grid of 14x14 patches, against a per-image cap; the block carries sentinel tokens and lead pads that align it to a 4-token compression stride, so its length depends on where it lands in the prompt | the maximum is a cap on the block (`vision_max_n_token`, checkpoint default 384) and lowers it, the minimum is read as the checkpoint's upscale floor and has no effect | not read |
+
+A GGUF model takes image input from a separate llama.cpp mmproj file, found in the model file's own folder or passed with `--mmproj` (see the
+[CLI reference](cli.md#image-input)). A GGUF file that carries the vision tensors itself (the Ollama layout) serves text only. The tower runs in bf16
+whatever the mmproj stores; a quantized mmproj is dequantized at load and keeps its quantization error. Image tokens and budgets are those of the
+family's row above.
 
 ## MoE strategies
 
@@ -62,6 +90,28 @@ have no resident path and stay on `offload`. Offload-only flags
 `--moe-prefill-hit-d2d`, `--disable-moe-prefill-overlap`) are ignored with a
 warning; pass `--moe-strategy offload` to use them.
 
+### Hosts that cap pinned memory (WSL)
+
+WSL caps CUDA pinned memory near half of RAM, so the expert banks of a large
+model may not all pin. With `--moe-cpu-layers auto`, FreeToken loads the banks
+first, then pins them layer by layer from the middle out until CUDA refuses one;
+the remaining head and tail layers are OS-locked instead (resident, but with no
+device address). After a refusal under WDDM (WSL and native Windows) it
+unpins about 3 GiB more (`FREETOKEN_PIN_PROBE_MARGIN_GB`).
+The probe runs only where pinning is known to be capped (WDDM, or
+`FREETOKEN_SIMULATE_PIN_CAP_GB` for testing). FTW checkpoints, dummy weights
+and models the CPU executor cannot serve take the size estimate instead, as
+does `FREETOKEN_PIN_BUDGET_GB`, which fixes the budget: the locked layers are
+then picked from a size estimate before the load, and a refused pin stops the
+boot.
+
+Under `hybrid`, a locked layer keeps GPU slots of its own pools. Each decode
+step it fetches a share of its misses (`--moe-locked-fetch`, by default from the `ft bench bw` profile): CPU threads
+copy the experts into a small pinned staging buffer
+(`--moe-locked-max-fetch` rows per bank) and the GPU copies them into the
+slots. The CPU computes the remaining misses, as on any hybrid layer. Under
+`offload`, locked layers decode on the CPU.
+
 ### NVLink-C2C hosts (GH200 / GB200)
 
 The host link is ~450 GB/s per direction instead of PCIe's ~32-64 GB/s. The
@@ -78,17 +128,29 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
 
 ## Notes
 
+- A checkpoint that fails to load: from a source checkout, run `PYTHONPATH=python python scripts/checkpoint_diagnose/diagnose.py <checkpoint dir or HF repo id>`. It reads the headers, not the weights, says whether FreeToken or the checkpoint is at fault, and for a local checkpoint gives the commands that fix a non-standard one; see [its README](../scripts/checkpoint_diagnose/README.md). GGUF files are checked with [scripts/gguf_check](../scripts/gguf_check/README.md).
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - An FTW converted by an older build with `--moe-backend fused` or `triton` keeps
   its experts as dense weights and no longer loads; reconvert it with `ft checkpoint`.
 - FTW files converted by builds before the quantization refactor may fail to load;
   see [ftw-hotfix.md](ftw-hotfix.md) for the affected checkpoints and the repair tool.
+- Muse-Glimmer keeps the attention gate as its own linear next to `qkv_proj`; an FTW converted
+  when the gate was fused into `qkvg_proj` no longer loads, reconvert it with `ft checkpoint`.
+- NVFP4 global scales are kept in fp32. An NVFP4 FTW that stores them as fp16 (converted by an
+  older build) is refused at load; reconvert it with `ft checkpoint`.
+- Qwen3.5 / Qwen3.6 / Qwen3.8-27B load their zero-centred norm weights as stored and add the 1 in
+  fp32 at runtime. An FTW of these models converted by an older build stores the norms with the 1
+  already added: it loads without an error but gives wrong output; reconvert it with `ft checkpoint`.
 - An FTW converted before its family served images holds no vision encoder: `ft serve`
   refuses it unless started with `--text-model-only` (or `--mm-disable vision`); reconvert it
   with `ft checkpoint`, or add the encoder in place with [scripts/ftw_hotfix.py](ftw-hotfix.md).
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
+- A DeepSeek-V4 GGUF takes image input from the Vision-Exp text file paired with its
+  `deepseek4v` mmproj; the text-only 0731 release has no image token and refuses the
+  mmproj. ggml-org's Vision-Exp text GGUF ships a chat template that renders no image
+  placeholder; serve unsloth's release for image requests.
 - DeepSeek-V4.1-Flash serves text and images from the HF checkpoint as shipped (fp8 block-32
   dense weights, fp4 experts on the offload cache, 890 B/token global KV in packed
   fp4/fp8 pools). Its two 98 GiB Engram tables stream from the checkpoint shards on
